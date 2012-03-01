@@ -62,7 +62,7 @@ static av_always_inline void transform4x4(vec_s16 src_01, vec_s16 src_23,
     case  7: add = vec_sl(vec_splat_s32(1), vec_splat_u32( 7 - 1)); break;
     case 10: add = vec_sl(vec_splat_s32(1), vec_splat_u32(10 - 1)); break;
     case 12: add = vec_sl(vec_splat_s32(1), vec_splat_u32(12 - 1)); break;
-    default: abort();
+    default: av_abort();
     }
 
     e0 = vec_add(e0, add);
@@ -84,7 +84,7 @@ static av_always_inline void scale(vec_s32 res[4], vec_s16 res_packed[2],
     case  7: v_shift = vec_splat_u32(7) ; break;
     case 10: v_shift = vec_splat_u32(10); break;
     case 12: v_shift = vec_splat_u32(12); break;
-    default: abort();
+    default: av_abort();
     }
 
     for (i = 0; i < 4; i++)
