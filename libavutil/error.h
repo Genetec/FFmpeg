@@ -125,13 +125,4 @@ static inline char *av_make_error_string(char *errbuf, size_t errbuf_size, int e
  * @}
  */
 
-/**
- * The av_abort function causes abnormal program termination. By default,
- * av_abort_callback calls stdlib abort. This behavior can be altered by
- * setting a different av_abort callback function.
- */
-void av_abort(void);
-void av_abort_set_callback(void (*)(void));
-void av_abort_default_callback(void);
-
 #endif /* AVUTIL_ERROR_H */
