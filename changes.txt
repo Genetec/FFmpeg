@@ -1,0 +1,419 @@
+diff --git a/configure b/configure
+index 6409b94b65..c9322f2697 100755
+--- a/configure
++++ b/configure
+@@ -3042,7 +3042,6 @@ wmv3_vdpau_hwaccel_select="vc1_vdpau_hwaccel"
+ 
+ # hardware-accelerated codecs
+ mediafoundation_deps="mftransform_h MFCreateAlignedMemoryBuffer"
+-mediafoundation_extralibs="-lmfplat -lmfuuid -lole32 -lstrmiids"
+ omx_deps="libdl pthreads"
+ omx_rpi_select="omx"
+ qsv_deps="libmfx"
+@@ -6686,6 +6685,9 @@ test_cpp <<EOF && enable uwp && d3d11va_extralibs="-ldxgi -ld3d11"
+ #endif
+ EOF
+ 
++# mediafoundation requires linking directly to mfplat if building for uwp target
++enabled uwp && mediafoundation_extralibs="-lmfplat -lmfuuid -lole32 -lstrmiids" || mediafoundation_extralibs="-lmfuuid -lole32 -lstrmiids"
++
+ enabled libdrm &&
+     check_pkg_config libdrm_getfb2 libdrm "xf86drmMode.h" drmModeGetFB2
+ 
+diff --git a/libavcodec/mf_utils.c b/libavcodec/mf_utils.c
+index eeabd0ce0b..48e3a63efc 100644
+--- a/libavcodec/mf_utils.c
++++ b/libavcodec/mf_utils.c
+@@ -47,39 +47,6 @@ HRESULT ff_MFSetAttributeSize(IMFAttributes *pattr, REFGUID guid,
+ #define ff_MFSetAttributeRatio ff_MFSetAttributeSize
+ #define ff_MFGetAttributeRatio ff_MFGetAttributeSize
+ 
+-// MFTEnumEx was missing from mingw-w64's mfplat import library until
+-// mingw-w64 v6.0.0, thus wrap it and load it using GetProcAddress.
+-// It's also missing in Windows Vista's mfplat.dll.
+-HRESULT ff_MFTEnumEx(GUID guidCategory, UINT32 Flags,
+-                     const MFT_REGISTER_TYPE_INFO *pInputType,
+-                     const MFT_REGISTER_TYPE_INFO *pOutputType,
+-                     IMFActivate ***pppMFTActivate, UINT32 *pnumMFTActivate)
+-{
+-    HRESULT (WINAPI *MFTEnumEx_ptr)(GUID guidCategory, UINT32 Flags,
+-                                    const MFT_REGISTER_TYPE_INFO *pInputType,
+-                                    const MFT_REGISTER_TYPE_INFO *pOutputType,
+-                                    IMFActivate ***pppMFTActivate,
+-                                    UINT32 *pnumMFTActivate) = NULL;
+-#if !HAVE_UWP
+-    HANDLE lib = GetModuleHandleW(L"mfplat.dll");
+-    if (lib)
+-        MFTEnumEx_ptr = (void *)GetProcAddress(lib, "MFTEnumEx");
+-#else
+-    // In UWP (which lacks GetModuleHandle), just link directly against
+-    // the functions - this requires building with new/complete enough
+-    // import libraries.
+-    MFTEnumEx_ptr = MFTEnumEx;
+-#endif
+-    if (!MFTEnumEx_ptr)
+-        return E_FAIL;
+-    return MFTEnumEx_ptr(guidCategory,
+-                         Flags,
+-                         pInputType,
+-                         pOutputType,
+-                         pppMFTActivate,
+-                         pnumMFTActivate);
+-}
+-
+ char *ff_hr_str_buf(char *buf, size_t size, HRESULT hr)
+ {
+ #define HR(x) case x: return (char *) # x;
+@@ -106,19 +73,20 @@ char *ff_hr_str_buf(char *buf, size_t size, HRESULT hr)
+ // If fill_data!=NULL, initialize the buffer and set the length. (This is a
+ // subtle but important difference: some decoders want CurrentLength==0 on
+ // provided output buffers.)
+-IMFSample *ff_create_memory_sample(void *fill_data, size_t size, size_t align)
++IMFSample *ff_create_memory_sample(MFFunctions *f,void *fill_data, size_t size,
++                                   size_t align)
+ {
+     HRESULT hr;
+     IMFSample *sample;
+     IMFMediaBuffer *buffer;
+ 
+-    hr = MFCreateSample(&sample);
++    hr = f->MFCreateSample(&sample);
+     if (FAILED(hr))
+         return NULL;
+ 
+     align = FFMAX(align, 16); // 16 is "recommended", even if not required
+ 
+-    hr = MFCreateAlignedMemoryBuffer(size, align - 1, &buffer);
++    hr = f->MFCreateAlignedMemoryBuffer(size, align - 1, &buffer);
+     if (FAILED(hr))
+         return NULL;
+ 
+@@ -548,7 +516,7 @@ const CLSID *ff_codec_to_mf_subtype(enum AVCodecID codec)
+     }
+ }
+ 
+-static int init_com_mf(void *log)
++static int init_com_mf(void *log, MFFunctions *f)
+ {
+     HRESULT hr;
+ 
+@@ -561,7 +529,7 @@ static int init_com_mf(void *log)
+         return AVERROR(ENOSYS);
+     }
+ 
+-    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
++    hr = f->MFStartup(MF_VERSION, MFSTARTUP_FULL);
+     if (FAILED(hr)) {
+         av_log(log, AV_LOG_ERROR, "could not initialize MediaFoundation\n");
+         CoUninitialize();
+@@ -571,15 +539,16 @@ static int init_com_mf(void *log)
+     return 0;
+ }
+ 
+-static void uninit_com_mf(void)
++static void uninit_com_mf(MFFunctions *f)
+ {
+-    MFShutdown();
++    f->MFShutdown();
+     CoUninitialize();
+ }
+ 
+ // Find and create a IMFTransform with the given input/output types. When done,
+ // you should use ff_free_mf() to destroy it, which will also uninit COM.
+ int ff_instantiate_mf(void *log,
++                      MFFunctions *f,
+                       GUID category,
+                       MFT_REGISTER_TYPE_INFO *in_type,
+                       MFT_REGISTER_TYPE_INFO *out_type,
+@@ -594,7 +563,7 @@ int ff_instantiate_mf(void *log,
+     IMFActivate *winner = 0;
+     UINT32 flags;
+ 
+-    ret = init_com_mf(log);
++    ret = init_com_mf(log, f);
+     if (ret < 0)
+         return ret;
+ 
+@@ -606,7 +575,7 @@ int ff_instantiate_mf(void *log,
+         flags |= MFT_ENUM_FLAG_SYNCMFT;
+     }
+ 
+-    hr = ff_MFTEnumEx(category, flags, in_type, out_type, &activate,
++    hr = f->MFTEnumEx(category, flags, in_type, out_type, &activate,
+                       &num_activate);
+     if (FAILED(hr))
+         goto error_uninit_mf;
+@@ -667,14 +636,14 @@ int ff_instantiate_mf(void *log,
+     return 0;
+ 
+ error_uninit_mf:
+-    uninit_com_mf();
++    uninit_com_mf(f);
+     return AVERROR(ENOSYS);
+ }
+ 
+-void ff_free_mf(IMFTransform **mft)
++void ff_free_mf(MFFunctions *f, IMFTransform **mft)
+ {
+     if (*mft)
+         IMFTransform_Release(*mft);
+     *mft = NULL;
+-    uninit_com_mf();
++    uninit_com_mf(f);
+ }
+diff --git a/libavcodec/mf_utils.h b/libavcodec/mf_utils.h
+index d514723c3b..3b12344f3e 100644
+--- a/libavcodec/mf_utils.h
++++ b/libavcodec/mf_utils.h
+@@ -41,6 +41,25 @@
+ 
+ #include "avcodec.h"
+ 
++// Windows N editions does not provide MediaFoundation by default.
++// So to avoid DLL loading error, MediaFoundation will be dynamically loaded
++// except on UWP build since LoadLibrary is not available on it.
++typedef struct MFFunctions {
++    HRESULT (WINAPI *MFStartup) (ULONG Version, DWORD dwFlags);
++    HRESULT (WINAPI *MFShutdown) (void);
++    HRESULT (WINAPI *MFCreateAlignedMemoryBuffer) (DWORD cbMaxLength,
++                                                   DWORD cbAligment,
++                                                   IMFMediaBuffer **ppBuffer);
++    HRESULT (WINAPI *MFCreateSample) (IMFSample **ppIMFSample);
++    HRESULT (WINAPI *MFCreateMediaType) (IMFMediaType **ppMFType);
++    // MFTEnumEx is missing in Windows Vista's mfplat.dll.
++    HRESULT (WINAPI *MFTEnumEx)(GUID guidCategory, UINT32 Flags,
++                                const MFT_REGISTER_TYPE_INFO *pInputType,
++                                const MFT_REGISTER_TYPE_INFO *pOutputType,
++                                IMFActivate ***pppMFTActivate,
++                                UINT32 *pnumMFTActivate);
++} MFFunctions;
++
+ // These functions do exist in mfapi.h, but are only available within
+ // __cplusplus ifdefs.
+ HRESULT ff_MFGetAttributeSize(IMFAttributes *pattr, REFGUID guid,
+@@ -50,15 +69,6 @@ HRESULT ff_MFSetAttributeSize(IMFAttributes *pattr, REFGUID guid,
+ #define ff_MFSetAttributeRatio ff_MFSetAttributeSize
+ #define ff_MFGetAttributeRatio ff_MFGetAttributeSize
+ 
+-// MFTEnumEx was missing from mingw-w64's mfplat import library until
+-// mingw-w64 v6.0.0, thus wrap it and load it using GetProcAddress.
+-// It's also missing in Windows Vista's mfplat.dll.
+-HRESULT ff_MFTEnumEx(GUID guidCategory, UINT32 Flags,
+-                     const MFT_REGISTER_TYPE_INFO *pInputType,
+-                     const MFT_REGISTER_TYPE_INFO *pOutputType,
+-                     IMFActivate ***pppMFTActivate, UINT32 *pnumMFTActivate);
+-
+-
+ // These do exist in mingw-w64's codecapi.h, but they aren't properly defined
+ // by the header until after mingw-w64 v7.0.0.
+ DEFINE_GUID(ff_CODECAPI_AVDecVideoThumbnailGenerationMode, 0x2efd8eee,0x1150,0x4328,0x9c,0xf5,0x66,0xdc,0xe9,0x33,0xfc,0xf4);
+@@ -150,7 +160,8 @@ char *ff_hr_str_buf(char *buf, size_t size, HRESULT hr);
+ #define FF_VAL_VT_UI4(v) FF_VARIANT_VALUE(VT_UI4, .ulVal = (v))
+ #define FF_VAL_VT_BOOL(v) FF_VARIANT_VALUE(VT_BOOL, .boolVal = (v))
+ 
+-IMFSample *ff_create_memory_sample(void *fill_data, size_t size, size_t align);
++IMFSample *ff_create_memory_sample(MFFunctions *f, void *fill_data,
++                                   size_t size, size_t align);
+ enum AVSampleFormat ff_media_type_to_sample_fmt(IMFAttributes *type);
+ enum AVPixelFormat ff_media_type_to_pix_fmt(IMFAttributes *type);
+ const GUID *ff_pix_fmt_to_guid(enum AVPixelFormat pix_fmt);
+@@ -160,10 +171,10 @@ char *ff_guid_str_buf(char *buf, size_t buf_size, const GUID *guid);
+ void ff_attributes_dump(void *log, IMFAttributes *attrs);
+ void ff_media_type_dump(void *log, IMFMediaType *type);
+ const CLSID *ff_codec_to_mf_subtype(enum AVCodecID codec);
+-int ff_instantiate_mf(void *log, GUID category,
++int ff_instantiate_mf(void *log, MFFunctions *f, GUID category,
+                       MFT_REGISTER_TYPE_INFO *in_type,
+                       MFT_REGISTER_TYPE_INFO *out_type,
+                       int use_hw, IMFTransform **res);
+-void ff_free_mf(IMFTransform **mft);
++void ff_free_mf(MFFunctions *f, IMFTransform **mft);
+ 
+ #endif
+diff --git a/libavcodec/mfenc.c b/libavcodec/mfenc.c
+index d70e49351a..2bd3866a19 100644
+--- a/libavcodec/mfenc.c
++++ b/libavcodec/mfenc.c
+@@ -31,6 +31,8 @@
+ 
+ typedef struct MFContext {
+     AVClass *av_class;
++    HMODULE library;
++    MFFunctions functions;
+     AVFrame *frame;
+     int is_video, is_audio;
+     GUID main_subtype;
+@@ -293,7 +295,8 @@ static IMFSample *mf_a_avframe_to_sample(AVCodecContext *avctx, const AVFrame *f
+     bps = av_get_bytes_per_sample(avctx->sample_fmt) * avctx->channels;
+     len = frame->nb_samples * bps;
+ 
+-    sample = ff_create_memory_sample(frame->data[0], len, c->in_info.cbAlignment);
++    sample = ff_create_memory_sample(&c->functions, frame->data[0], len,
++                                     c->in_info.cbAlignment);
+     if (sample)
+         IMFSample_SetSampleDuration(sample, mf_to_mf_time(avctx, frame->nb_samples));
+     return sample;
+@@ -313,7 +316,8 @@ static IMFSample *mf_v_avframe_to_sample(AVCodecContext *avctx, const AVFrame *f
+     if (size < 0)
+         return NULL;
+ 
+-    sample = ff_create_memory_sample(NULL, size, c->in_info.cbAlignment);
++    sample = ff_create_memory_sample(&c->functions, NULL, size,
++                                     c->in_info.cbAlignment);
+     if (!sample)
+         return NULL;
+ 
+@@ -423,7 +427,9 @@ static int mf_receive_sample(AVCodecContext *avctx, IMFSample **out_sample)
+         }
+ 
+         if (!c->out_stream_provides_samples) {
+-            sample = ff_create_memory_sample(NULL, c->out_info.cbSize, c->out_info.cbAlignment);
++            sample = ff_create_memory_sample(&c->functions, NULL,
++                                             c->out_info.cbSize,
++                                             c->out_info.cbAlignment);
+             if (!sample)
+                 return AVERROR(ENOMEM);
+         }
+@@ -778,7 +784,7 @@ static int mf_choose_output_type(AVCodecContext *avctx)
+     if (out_type) {
+         av_log(avctx, AV_LOG_VERBOSE, "picking output type %d.\n", out_type_index);
+     } else {
+-        hr = MFCreateMediaType(&out_type);
++        hr = c->functions.MFCreateMediaType(&out_type);
+         if (FAILED(hr)) {
+             ret = AVERROR(ENOMEM);
+             goto done;
+@@ -1006,7 +1012,8 @@ err:
+     return res;
+ }
+ 
+-static int mf_create(void *log, IMFTransform **mft, const AVCodec *codec, int use_hw)
++static int mf_create(void *log, MFFunctions *f, IMFTransform **mft,
++                     const AVCodec *codec, int use_hw)
+ {
+     int is_audio = codec->type == AVMEDIA_TYPE_AUDIO;
+     const CLSID *subtype = ff_codec_to_mf_subtype(codec->id);
+@@ -1029,13 +1036,13 @@ static int mf_create(void *log, IMFTransform **mft, const AVCodec *codec, int us
+         category = MFT_CATEGORY_VIDEO_ENCODER;
+     }
+ 
+-    if ((ret = ff_instantiate_mf(log, category, NULL, &reg, use_hw, mft)) < 0)
++    if ((ret = ff_instantiate_mf(log, f, category, NULL, &reg, use_hw, mft)) < 0)
+         return ret;
+ 
+     return 0;
+ }
+ 
+-static int mf_init(AVCodecContext *avctx)
++static int mf_init_encoder(AVCodecContext *avctx)
+ {
+     MFContext *c = avctx->priv_data;
+     HRESULT hr;
+@@ -1059,7 +1066,7 @@ static int mf_init(AVCodecContext *avctx)
+ 
+     c->main_subtype = *subtype;
+ 
+-    if ((ret = mf_create(avctx, &c->mft, avctx->codec, use_hw)) < 0)
++    if ((ret = mf_create(avctx, &c->functions, &c->mft, avctx->codec, use_hw)) < 0)
+         return ret;
+ 
+     if ((ret = mf_unlock_async(avctx)) < 0)
+@@ -1123,6 +1130,54 @@ static int mf_init(AVCodecContext *avctx)
+     return 0;
+ }
+ 
++#if !HAVE_UWP
++#define LOAD_MF_FUNCTION(context, func_name) \
++    context->functions.func_name = (void *)GetProcAddress(context->library, #func_name); \
++    if (!context->functions.func_name) { \
++        av_log(context, AV_LOG_ERROR, "DLL mfplat.dll failed to find function "\
++           #func_name "\n"); \
++        return AVERROR_UNKNOWN; \
++    }
++#else
++// In UWP (which lacks LoadLibrary), just link directly against
++// the functions - this requires building with new/complete enough
++// import libraries.
++#define LOAD_MF_FUNCTION(context, func_name) \
++    context->functions.func_name = func_name; \
++    if (!context->functions.func_name) { \
++        av_log(context, AV_LOG_ERROR, "Failed to find function " #func_name \
++               "\n"); \
++        return AVERROR_UNKNOWN; \
++    }
++#endif
++
++// Windows N editions does not provide MediaFoundation by default.
++// So to avoid DLL loading error, MediaFoundation is dynamically loaded except
++// on UWP build since LoadLibrary is not available on it.
++static int mf_load_library(AVCodecContext *avctx)
++{
++    MFContext *c = avctx->priv_data;
++
++#if !HAVE_UWP
++    c->library = LoadLibraryA("mfplat.dll");
++
++    if (!c->library) {
++        av_log(c, AV_LOG_ERROR, "DLL mfplat.dll failed to open\n");
++        return AVERROR_UNKNOWN;
++    }
++#endif
++
++    LOAD_MF_FUNCTION(c, MFStartup);
++    LOAD_MF_FUNCTION(c, MFShutdown);
++    LOAD_MF_FUNCTION(c, MFCreateAlignedMemoryBuffer);
++    LOAD_MF_FUNCTION(c, MFCreateSample);
++    LOAD_MF_FUNCTION(c, MFCreateMediaType);
++    // MFTEnumEx is missing in Windows Vista's mfplat.dll.
++    LOAD_MF_FUNCTION(c, MFTEnumEx);
++
++    return 0;
++}
++
+ static int mf_close(AVCodecContext *avctx)
+ {
+     MFContext *c = avctx->priv_data;
+@@ -1133,7 +1188,15 @@ static int mf_close(AVCodecContext *avctx)
+     if (c->async_events)
+         IMFMediaEventGenerator_Release(c->async_events);
+ 
+-    ff_free_mf(&c->mft);
++#if !HAVE_UWP
++    if (c->library)
++        ff_free_mf(&c->functions, &c->mft);
++
++    FreeLibrary(c->library);
++    c->library = NULL;
++#else
++    ff_free_mf(&c->functions, &c->mft);
++#endif
+ 
+     av_frame_free(&c->frame);
+ 
+@@ -1143,6 +1206,18 @@ static int mf_close(AVCodecContext *avctx)
+     return 0;
+ }
+ 
++static int mf_init(AVCodecContext *avctx)
++{
++    int ret;
++    if ((ret = mf_load_library(avctx)) == 0) {
++           if ((ret = mf_init_encoder(avctx)) == 0) {
++                return 0;
++        }
++    }
++    mf_close(avctx);
++    return ret;
++}
++
+ #define OFFSET(x) offsetof(MFContext, x)
+ 
+ #define MF_ENCODER(MEDIATYPE, NAME, ID, OPTS, EXTRA) \
+diff --git a/sourcelink.json b/sourcelink.json
+index 31e809f9de..76775c09c1 100644
+--- a/sourcelink.json
++++ b/sourcelink.json
+@@ -1 +1 @@
+-{"documents":{"/c/git/github/ffmpeg/*":"https://raw.githubusercontent.com/FFmpeg/FFmpeg/d61977cbe453869cec28d32b71fe25c2cd965dcf/*"}}
++{"documents":{"/c/git/Genetec.Video.Ffmpeg/*":"https://raw.githubusercontent.com/FFmpeg/FFmpeg/7ab7d42cc98bcf0c5cda3f99eb35e20be1890646/*"}}
+\ No newline at end of file
