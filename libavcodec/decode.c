@@ -544,6 +544,7 @@ static int decode_receive_frame_internal(AVCodecContext *avctx, AVFrame *frame)
 
     if (avctx->codec->receive_frame) {
         ret = avctx->codec->receive_frame(avctx, frame);
+        emms_c();
         if (ret != AVERROR(EAGAIN))
             av_packet_unref(avci->last_pkt_props);
     } else
