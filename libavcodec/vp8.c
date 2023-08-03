@@ -160,7 +160,7 @@ static VP8Frame *vp8_find_free_buffer(VP8Context *s)
         }
     if (i == 5) {
         av_log(s->avctx, AV_LOG_FATAL, "Ran out of free frames!\n");
-        abort();
+        av_abort();
     }
     if (frame->tf.f->buf[0])
         vp8_release_frame(s, frame);

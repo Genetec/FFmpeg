@@ -433,7 +433,7 @@ static int find_unused_picture(AVCodecContext *avctx, Picture *picture, int shar
      * all. Similarly, missing reference frames have to be replaced by
      * interpolated/MC frames, anything else is a bug in the codec ...
      */
-    abort();
+    av_abort();
     return -1;
 }
 
